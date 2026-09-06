@@ -14,6 +14,9 @@
 #   storage     local-path-provisioner を default StorageClass として入れる
 #   lb          Cilium LB IPAM のプールと L2 広告ポリシーを適用
 #   mesh        Gateway API CRD + Istio (sidecar)
+#   gateway     クラスタ共有の Gateway を 1 枚立てる
+#   sealed      Sealed Secrets controller (暗号文を git に置けるようにする)
+#   argocd      Argo CD + Application 定義
 #   registry    ローカルレジストリを docker VM に立てる
 #   status      各レイヤの状態を出す
 #
@@ -35,6 +38,12 @@ LOCAL_PATH_VERSION=${LOCAL_PATH_VERSION:-v0.0.31}
 LB_POOL=${LB_POOL:-192.168.104.240/28}
 # レジストリのホスト名。実 IP は各ノードの /etc/hosts が解決する。
 REGISTRY_HOST=${REGISTRY_HOST:-registry.local}
+# クラスタ共有の Gateway。アプリの HTTPRoute はここに parentRef で紐づく。
+GATEWAY_NS=${GATEWAY_NS:-istio-ingress}
+GATEWAY_NAME=${GATEWAY_NAME:-shared}
+ARGOCD_VERSION=${ARGOCD_VERSION:-v3.5.2}
+# kubeseal (Homebrew) と controller のマイナーは揃えること。ずれると封が開かない。
+SEALED_SECRETS_VERSION=${SEALED_SECRETS_VERSION:-v0.39.1}
 
 KUBECTL="kubectl --context ${KUBECTX}"
 
@@ -255,6 +264,75 @@ step_mesh() {
   $KUBECTL -n istio-system get pods
 }
 
+# クラスタに 1 枚だけの共有 Gateway。アプリのリポジトリは HTTPRoute だけを持ち、
+# parentRefs でここに紐づける。
+step_gateway() {
+  echo "==> 共有 Gateway (${GATEWAY_NS}/${GATEWAY_NAME})"
+  $KUBECTL apply -k "$SCRIPT_DIR/k8s/gateway"
+  # Istio が Deployment と Service を生成し、Cilium の LB IPAM が IP を払い出すまで待つ。
+  $KUBECTL -n "$GATEWAY_NS" wait --for=condition=Programmed \
+    "gateway/${GATEWAY_NAME}" --timeout=180s
+  echo "GATEWAY_IP=$(step_gateway_addr)"
+}
+
+# 共有 Gateway に払い出された LoadBalancer IP。アプリ側の Makefile がこれを引く。
+step_gateway_addr() {
+  $KUBECTL -n "$GATEWAY_NS" get "gateway/${GATEWAY_NAME}" \
+    -o jsonpath='{.status.addresses[0].value}'
+}
+
+step_sealed() {
+  echo "==> Sealed Secrets controller ${SEALED_SECRETS_VERSION}"
+  # 平文の Secret を git に置かずに済ませるための仕組み。
+  # controller が生成した秘密鍵はクラスタの中だけにあり、kubeseal で封をした
+  # 暗号文は public repo に置いても開けない。
+  $KUBECTL apply -f \
+    "https://github.com/bitnami-labs/sealed-secrets/releases/download/${SEALED_SECRETS_VERSION}/controller.yaml"
+  $KUBECTL -n kube-system rollout status deployment/sealed-secrets-controller --timeout=180s
+  echo
+  echo "  手元に CLI が要る:  brew install kubeseal"
+  echo "  鍵はクラスタ内にしかない。消すと既存の SealedSecret は二度と開かない。"
+  echo "  退避:  make sealed-backup"
+}
+
+step_argocd() {
+  echo "==> Argo CD ${ARGOCD_VERSION}"
+  $KUBECTL create namespace argocd --dry-run=client -o yaml | $KUBECTL apply -f -
+  # --server-side が必須。クライアント側 apply は last-applied-configuration を
+  # annotation に丸ごと入れるが、applicationsets の CRD がその 256KB 上限を超える。
+  # --force-conflicts は再実行時のフィールド所有権の衝突を通すため。
+  $KUBECTL -n argocd apply --server-side --force-conflicts -f \
+    "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
+
+  echo "==> server.insecure と UI の HTTPRoute"
+  # argocd-server は既定で自分が TLS を終端し、平文 HTTP を HTTPS へ
+  # リダイレクトする。Gateway が平文で受けている今の構成だと転送のたびに
+  # リダイレクトが返ってループするので、内側は平文に落とす。
+  # merge patch を使うのは、install.yaml が将来この ConfigMap に既定値を
+  # 入れてきても消さないため (apply だと data ごと置き換わる)。
+  $KUBECTL -n argocd patch configmap argocd-cmd-params-cm \
+    --type merge -p '{"data":{"server.insecure":"true"}}'
+  $KUBECTL apply -k "$SCRIPT_DIR/k8s/argocd"
+  # ConfigMap は起動時にしか読まれないので、パッチを当てたら入れ直す
+  $KUBECTL -n argocd rollout restart deployment/argocd-server
+  $KUBECTL -n argocd rollout status deployment/argocd-server --timeout=300s
+  $KUBECTL -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+
+  echo "==> Application を登録"
+  $KUBECTL apply -k "$SCRIPT_DIR/k8s/apps"
+
+  echo
+  echo "  UI:   http://argocd.localtest.me:18080  (make tunnel が要る)"
+  echo "  user: admin"
+  echo "  pass: make argocd-password"
+}
+
+# 初期 admin パスワード。install.yaml が Secret に平文で置く。
+step_argocd_password() {
+  $KUBECTL -n argocd get secret argocd-initial-admin-secret \
+    -o jsonpath='{.data.password}' | base64 -d; echo
+}
+
 step_registry() {
   local reg_ip
   reg_ip=$(node_ip "$DOCKER_VM" || true)
@@ -370,6 +448,8 @@ step_context() { echo "$KUBECTX"; }
 step_addr() {
   echo "KUBECTX=$(step_context)"
   echo "REGISTRY=$(step_registry_addr)"
+  echo "GATEWAY=${GATEWAY_NS}/${GATEWAY_NAME} ($(step_gateway_addr 2>/dev/null || echo '未払い出し'))"
+  echo "ARGOCD=http://argocd.localtest.me:18080"
 }
 
 step_status() {
@@ -380,6 +460,8 @@ step_status() {
   echo; echo "=== storageclass ==="; $KUBECTL get sc
   echo; echo "=== istio ==="; $KUBECTL -n istio-system get pods 2>/dev/null || true
   echo; echo "=== gateway ==="; $KUBECTL get gateway -A 2>/dev/null || true
+  echo; echo "=== httproute ==="; $KUBECTL get httproute -A 2>/dev/null || true
+  echo; echo "=== argocd ==="; $KUBECTL -n argocd get applications 2>/dev/null || true
 }
 
 # --- ディスパッチ ---------------------------------------------------------
@@ -393,6 +475,11 @@ case "${1:-}" in
   storage)    step_storage ;;
   lb)         step_lb ;;
   mesh)       step_mesh ;;
+  gateway)    step_gateway ;;
+  gateway-addr) step_gateway_addr ;;
+  sealed)     step_sealed ;;
+  argocd)     step_argocd ;;
+  argocd-password) step_argocd_password ;;
   registry)   step_registry ;;
   docker-vm)  step_docker_vm ;;
   registry-addr) step_registry_addr ;;
@@ -401,7 +488,7 @@ case "${1:-}" in
   status)     step_status ;;
   node-ip)    node_ip "${2:?VM 名が必要}" ;;
   *)
-    echo "使い方: $0 {vms|init|kubeconfig|cni|join|storage|lb|mesh|docker-vm|registry|status|addr|registry-addr|context|node-ip <vm>}" >&2
+    echo "使い方: $0 {vms|init|kubeconfig|cni|join|storage|lb|mesh|gateway|sealed|argocd|docker-vm|registry|status|addr|gateway-addr|registry-addr|argocd-password|context|node-ip <vm>}" >&2
     exit 1
     ;;
 esac

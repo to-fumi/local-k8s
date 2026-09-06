@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Argo CD 本体 (install.yaml) は bootstrap.sh が先に apply する。
+# ここは UI を共有 Gateway に出すための HTTPRoute だけ。
+# server.insecure は bootstrap.sh が kubectl patch --type merge で当てる
+# (install.yaml の ConfigMap をここの resources に取り込んでいないので
+#  kustomize の patches では対象を見つけられない)。
+namespace: argocd
+
+resources:
+  - httproute.yaml

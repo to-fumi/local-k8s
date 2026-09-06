@@ -1,0 +1,11 @@
+# 共有 Gateway 専用の namespace。
+# Istio は Gateway リソースと同じ namespace に gateway の Deployment と
+# Service(type: LoadBalancer) を自動生成するので、ここが実際に
+# LoadBalancer IP を 1 つ受け取る場所になる。
+#
+# sidecar は注入しない (istio-injection ラベルを付けない)。
+# gateway Pod 自身が Envoy なので、その中にもう一枚 Envoy を挿す意味がない。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-ingress

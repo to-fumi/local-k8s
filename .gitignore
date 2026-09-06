@@ -1,1 +1,5 @@
 .DS_Store
+
+# Sealed Secrets の秘密鍵の退避先 (make sealed-backup)。
+# これは平文の鍵なので絶対にコミットしない。public repo なら尚更。
+sealed-secrets-key-*.yaml

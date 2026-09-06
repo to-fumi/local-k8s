@@ -6,6 +6,8 @@ DOCKER_VM    := docker
 KUBECTX      := kubeadm-local
 BOOTSTRAP    := CP=$(CP) WORKERS="$(WORKERS)" DOCKER_VM=$(DOCKER_VM) KUBECTX=$(KUBECTX) ./bootstrap.sh
 KUBECTL      := kubectl --context $(KUBECTX)
+GATEWAY_NS   := istio-ingress
+TUNNEL_PORT  ?= 18080
 NS           ?=
 
 .PHONY: help
@@ -15,7 +17,7 @@ help: ## コマンド一覧
 # --- クラスタ ---------------------------------------------------------------
 
 .PHONY: up
-up: ## クラスタを一式立てる (VM -> kubeadm -> Cilium -> addons -> Istio -> レジストリ)
+up: ## クラスタを一式立てる (VM -> kubeadm -> Cilium -> addons -> Istio -> Gateway -> レジストリ -> Argo CD)
 	$(BOOTSTRAP) vms
 	$(BOOTSTRAP) init
 	$(BOOTSTRAP) kubeconfig
@@ -24,8 +26,11 @@ up: ## クラスタを一式立てる (VM -> kubeadm -> Cilium -> addons -> Isti
 	$(BOOTSTRAP) storage
 	$(BOOTSTRAP) lb
 	$(BOOTSTRAP) mesh
+	$(BOOTSTRAP) gateway
+	$(BOOTSTRAP) sealed
 	$(BOOTSTRAP) docker-vm
 	$(BOOTSTRAP) registry
+	$(BOOTSTRAP) argocd
 	@echo
 	@$(MAKE) --no-print-directory addr
 
@@ -61,6 +66,18 @@ lb: ## [個別] Cilium LB IPAM + L2 広告
 mesh: ## [個別] Gateway API CRD + Istio
 	$(BOOTSTRAP) mesh
 
+.PHONY: gateway
+gateway: ## [個別] クラスタ共有の Gateway を 1 枚立てる
+	$(BOOTSTRAP) gateway
+
+.PHONY: sealed
+sealed: ## [個別] Sealed Secrets controller (暗号文を git に置けるようにする)
+	$(BOOTSTRAP) sealed
+
+.PHONY: argocd
+argocd: ## [個別] Argo CD + Application 定義 (レジストリの後に流すこと)
+	$(BOOTSTRAP) argocd
+
 .PHONY: docker-vm
 docker-vm: ## [個別] ビルド用 docker VM を用意してクラスタと同じ網に繋ぐ
 	$(BOOTSTRAP) docker-vm
@@ -82,7 +99,7 @@ destroy: ## VM ごと消す
 	@for n in $(CP) $(WORKERS); do limactl delete -f $$n || true; done
 
 # --- アプリ側リポジトリが使う接続点 ------------------------------------------
-# 載せる側はこの 2 つだけ知っていればいい。
+# 載せる側が知るのは context / registry / 共有 Gateway の 3 つだけ。
 
 .PHONY: addr
 addr: ## 接続情報 (context と registry) を eval できる形で出す
@@ -95,6 +112,48 @@ registry-addr: ## レジストリのアドレスだけ出す (docker VM の DHCP
 .PHONY: context
 context: ## kubectl の context 名を出す
 	@$(BOOTSTRAP) context
+
+.PHONY: gateway-addr
+gateway-addr: ## 共有 Gateway の LoadBalancer IP を出す
+	@$(BOOTSTRAP) gateway-addr
+
+.PHONY: tunnel
+tunnel: ## 共有 Gateway への SSH トンネル (前景 / 全アプリで 1 本)
+	@# user-v2 はユーザモードのネットワークなので macOS 側に LB のサブネットへの
+	@# 経路がなく、また Cilium の NodePort は eBPF 処理で listen ソケットを持たないため
+	@# Lima の自動ポート転送にも引っかからない。cp ノードを踏み台にして LB IP へ繋ぐ。
+	@ip=$$($(BOOTSTRAP) gateway-addr 2>/dev/null); \
+	if [ -z "$$ip" ]; then \
+	  echo "共有 Gateway にアドレスがない: $(KUBECTL) -n $(GATEWAY_NS) get gateway" >&2; exit 1; fi; \
+	echo "127.0.0.1:$(TUNNEL_PORT)  ->  $$ip:80   (Ctrl-C で終了)"; \
+	echo "  振り分けは Host ヘッダで行う。例: http://what-for-dinner.localtest.me:$(TUNNEL_PORT)/docs"; \
+	echo "  (*.localtest.me は公開 DNS が 127.0.0.1 を返すので /etc/hosts は要らない)"; \
+	$(KUBECTL) get httproute -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,HOSTNAMES:.spec.hostnames; \
+	ssh -F $$HOME/.lima/$(CP)/ssh.config -N -L $(TUNNEL_PORT):$$ip:80 lima-$(CP)
+
+# --- GitOps -----------------------------------------------------------------
+
+.PHONY: argocd-password
+argocd-password: ## Argo CD の初期 admin パスワード
+	@$(BOOTSTRAP) argocd-password
+
+.PHONY: argocd-apps
+argocd-apps: ## Application の同期状況
+	@$(KUBECTL) -n argocd get applications \
+	    -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,REVISION:.status.sync.revision
+
+.PHONY: argocd-sync
+argocd-sync: ## git を今すぐ引き直させる (既定のポーリングは 3 分間隔)
+	@$(KUBECTL) -n argocd annotate applications --all \
+	    argocd.argoproj.io/refresh=hard --overwrite
+
+.PHONY: sealed-backup
+sealed-backup: ## Sealed Secrets の秘密鍵を退避 (これを失うと既存の封は開かない)
+	@out=sealed-secrets-key-$$(date +%Y%m%d%H%M%S).yaml; \
+	$(KUBECTL) -n kube-system get secret \
+	    -l sealedsecrets.bitnami.com/sealed-secrets-key=active -o yaml > $$out; \
+	chmod 600 $$out; \
+	echo "$$out に書き出した。**git に入れないこと** (これは平文の秘密鍵)"
 
 # --- 観測 -------------------------------------------------------------------
 

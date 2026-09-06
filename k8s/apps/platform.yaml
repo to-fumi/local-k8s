@@ -1,0 +1,22 @@
+# クラスタ共通のもの (共有 Gateway) をこのリポジトリ自身から pull する。
+#
+# Argo CD 本体はここに含めない。自分で自分を管理させると、壊したときに
+# 直す手段ごと壊れる。本体は bootstrap.sh が命令的に入れる。
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/to-fumi/local-k8s.git
+    targetRevision: main
+    path: k8s/gateway
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      # git にないものは消す / 手で変えたら git に戻す
+      prune: true
+      selfHeal: true

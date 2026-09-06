@@ -1,0 +1,29 @@
+# クラスタに 1 枚だけ置く共有 Gateway。
+#
+# なぜアプリのリポジトリではなくここにあるか:
+# gatewayClassName: istio の Gateway は 1 枚ごとに gateway の Deployment と
+# Service(type: LoadBalancer) が生える。アプリごとに Gateway を持つと
+# Cilium の LB プール (192.168.104.240/28 = 実質 14 IP) を 1 アプリ 1 IP で
+# 食い潰し、macOS からの SSH トンネルもアプリごとに別ポートで張ることになる。
+#
+# Gateway API の想定する分担もこの形になっている。
+#   Gateway   = プラットフォームの関心事 (どこで受けるか)      -> このリポジトリ
+#   HTTPRoute = アプリの関心事 (どの Host を何に振るか)        -> 各アプリのリポジトリ
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared
+  namespace: istio-ingress
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      # from: All にしないと、別 namespace にいるアプリの HTTPRoute が
+      # この Gateway に parentRef で紐づけられない。
+      # cross-namespace の parentRef を許可するのはここだけで足りる
+      # (ReferenceGrant が要るのは backendRef が namespace をまたぐ場合)。
+      allowedRoutes:
+        namespaces:
+          from: All

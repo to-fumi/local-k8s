@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: what-for-dinner
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/to-fumi/what-for-dinner.git
+    targetRevision: main
+    path: k8s/overlays/local
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: what-for-dinner
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+  ignoreDifferences:
+    # イメージのタグが :dev で固定なので、新しいイメージを push しても
+    # マニフェストには差分が出ない。反映には rollout restart が要るが、
+    # これは Pod template に restartedAt の annotation を足すので、
+    # そのままだと selfHeal が「git と違う」と判定して巻き戻してしまう。
+    # タグを git sha にして毎回コミットすれば要らなくなるが、
+    # ローカルの開発ループでコミットが増えるので今はこちらを取る。
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt

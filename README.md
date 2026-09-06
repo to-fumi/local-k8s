@@ -13,7 +13,7 @@ docker   192.168.104.5   ビルド用 + レジストリ (registry.local:5000)
 ## 立てる
 
 ```bash
-brew install lima kubectl cilium-cli istioctl hubble docker docker-buildx
+brew install lima kubectl cilium-cli istioctl hubble docker docker-buildx kubeseal
 make up          # 15〜20 分
 ```
 
@@ -22,6 +22,8 @@ make up          # 15〜20 分
 ```
 KUBECTX=kubeadm-local
 REGISTRY=registry.local:5000
+GATEWAY=istio-ingress/shared (192.168.104.241)
+ARGOCD=http://argocd.localtest.me:18080
 ```
 
 レジストリは**固定のホスト名**で公開する。docker VM の IP は DHCP で変わるので、
@@ -31,7 +33,13 @@ IP をイメージ名に埋めるとアプリ側のマニフェストが環境�
 
 ## 他のリポジトリから使う
 
-アプリ側が知る必要があるのは**この 2 つだけ**。あとは普通に build して push して apply する。
+アプリ側が知る必要があるのは**この 3 つだけ**。あとは普通に build して push して apply する。
+
+| | | |
+|---|---|---|
+| context | `kubeadm-local` | `make context` |
+| レジストリ | `registry.local:5000` | `make registry-addr` |
+| 共有 Gateway | `istio-ingress/shared` | `make gateway-addr` |
 
 ```bash
 docker build -t registry.local:5000/myapp:dev .
@@ -48,21 +56,130 @@ KUBECTX    = $(shell $(MAKE) -s -C $(LOCAL_K8S) context)
 REGISTRY   = $(shell $(MAKE) -s -C $(LOCAL_K8S) registry-addr)
 ```
 
+### 何をこちらに置き、何をアプリ側に置くか
+
+| | 置き場所 | |
+|---|---|---|
+| Gateway | **local-k8s** | クラスタに 1 枚。どこで受けるかはプラットフォームの関心事 |
+| GatewayClass / Istio / CNI / StorageClass | **local-k8s** | クラスタに 1 つあれば足りる |
+| HTTPRoute | アプリ | どの Host を何に振るかはアプリの関心事 |
+| Namespace / Deployment / Service / PVC / Secret | アプリ | アプリが増えれば増える |
+
+**Gateway をアプリごとに持たせない**のが要点。`gatewayClassName: istio` の Gateway は
+1 枚ごとに gateway の Deployment と Service(type: LoadBalancer) が生えるので、
+アプリごとに持つと LB プール (`192.168.104.240/28` = 実質 14 IP) を 1 アプリ 1 IP で
+食い潰し、トンネルもアプリごとに別ポートで張ることになる。
+GKE でも Gateway はプラットフォームチーム、HTTPRoute はアプリチームという分担が標準。
+
+### アプリ側の HTTPRoute の書き方
+
+共有 Gateway は別 namespace にいるので `parentRefs` に namespace を書く。
+**振り分けは Host ヘッダで行う**ので、`hostnames` を必ず付ける
+(付けないと全 Host を拾ってしまい、次のアプリと衝突する)。
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api
+spec:
+  parentRefs:
+    - name: shared
+      namespace: istio-ingress
+  hostnames:
+    - myapp.localtest.me
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - name: api
+          port: 8000
+```
+
+cross-namespace の `parentRefs` は Gateway 側の `allowedRoutes.namespaces.from: All`
+だけで許可される。ReferenceGrant は要らない (あれは `backendRefs` が namespace を
+またぐ場合の仕組み)。
+
+`*.localtest.me` は**公開 DNS が 127.0.0.1 を返す**ので、`/etc/hosts` をいじらずに
+トンネル越しの Host ヘッダ振り分けがそのまま成立する。
+
 実例は [what-for-dinner](../what-for-dinner) の Makefile と `k8s/` にある。
 
 ## クラスタの外から叩く
 
 macOS から Pod や LoadBalancer IP には**直接届かない**（理由は後述）。
-Service へ繋ぐには cp ノードを踏み台にしたトンネルを張る。
+共有 Gateway へのトンネルを 1 本張れば、あとは Host ヘッダで全アプリに振り分ける。
 
 ```bash
-ssh -F ~/.lima/wfd-cp/ssh.config -N -L 18080:<LB IP>:80 lima-wfd-cp
+make tunnel     # 127.0.0.1:18080 -> 共有 Gateway
+curl http://what-for-dinner.localtest.me:18080/docs
 ```
+
+アプリごとにトンネルを張る必要はない。Gateway が 1 枚なので**ポートも 1 本で足りる**。
+
+## GitOps (Argo CD)
+
+マニフェストの反映は Argo CD が git から pull する。`kubectl apply` は
+クラスタを組み立てるときだけで、以後アプリの更新は **git に push するだけ**。
+
+```bash
+make argocd-apps        # Application の同期状況
+make argocd-password    # 初期 admin パスワード
+make argocd-sync        # 今すぐ引き直させる (既定のポーリングは 3 分間隔)
+```
+
+UI は共有 Gateway に相乗りしているので、トンネル 1 本で見える。
+
+```bash
+make tunnel
+open http://argocd.localtest.me:18080     # admin / make argocd-password
+```
+
+### Application の分け方
+
+Gateway/HTTPRoute の分担がそのまま Application の分担になっている。
+
+| Application | repo | path | 中身 |
+|---|---|---|---|
+| `platform` | local-k8s | `k8s/gateway` | 共有 Gateway |
+| `what-for-dinner` | what-for-dinner | `k8s/overlays/local` | アプリ一式 |
+
+アプリを増やすときは `k8s/apps/` に Application を 1 枚足すだけ。
+
+**Argo CD 自身は Application にしていない。** 自分で自分を管理させると、
+壊したときに直す手段ごと壊れる。本体は `make argocd` が命令的に入れる。
+
+### イメージの更新は Argo では起きない
+
+タグを `:dev` で固定しているので、**新しいイメージを push してもマニフェストに
+差分が出ず、Argo は何もしない**。反映にはアプリ側の `make k8s-restart`
+(= `rollout restart`) が要る。
+
+本来の GitOps はタグを git sha にして `kustomize edit set image` をコミットする形だが、
+ローカルの開発ループでコミットが増えるので取っていない。代わりに restart が足す
+`kubectl.kubernetes.io/restartedAt` を Application の `ignoreDifferences` に
+入れてある。**これがないと selfHeal が restart を巻き戻す。**
+
+### Secret は Sealed Secrets
+
+平文の Secret は git に置けないが、public repo で GitOps をやる以上どこかに
+置かないと「git を見れば全部わかる」が成立しない。controller が持つ秘密鍵で
+しか開かない暗号文にして、それをコミットする。
+
+```bash
+make sealed          # controller を入れる (make up に含まれる)
+make sealed-backup   # 秘密鍵を退避 (.gitignore 済み)
+```
+
+封をするのはアプリ側 (`make k8s-seal`)。**鍵はクラスタの中にしかないので、
+`make destroy` すると既存の SealedSecret は二度と開かない。**
+クラスタを作り直したら封をし直すか、`make sealed-backup` した鍵を戻す。
+kubeseal (Homebrew) と controller のマイナーバージョンは揃えること。
 
 ## 中を見る
 
 ```bash
-make status        # ノード / Cilium / Istio
+make status        # ノード / Cilium / Istio / Gateway / HTTPRoute
 make ebpf          # Service が eBPF マップにどう載っているか
 make hubble-watch NS=what-for-dinner
 make hubble-ui
@@ -86,6 +203,9 @@ make destroy       # VM ごと消す
 | Cloud Load Balancing | Cilium LB IPAM + L2 広告 | MetalLB を足さずに Cilium だけで完結する |
 | Cloud Service Mesh (旧 ASM) | Istio (sidecar) | **ASM の実体は Istio** |
 | GKE Gateway controller | Istio の Gateway API 実装 | Ingress は機能凍結済みなので Gateway/HTTPRoute |
+| 共有 Ingress (プラットフォーム管理) | `istio-ingress/shared` Gateway 1 枚 | Gateway はクラスタ側、HTTPRoute はアプリ側という Gateway API の分担 |
+| Config Sync / Cloud Deploy | Argo CD | GKE でも Argo CD はそのまま使える。pull 型なのでクラスタに認証情報を渡さなくていい |
+| Secret Manager | Sealed Secrets | 平文を git に置かずに済ませる最小の仕組み |
 | PD CSI | local-path-provisioner | PVC が要るのは Postgres 1 台だけ |
 
 ## バージョン
@@ -96,8 +216,10 @@ make destroy       # VM ごと消す
 | Cilium | 1.20.1 | |
 | Istio | 1.31.0 | |
 | Gateway API | v1.6.2 | standard channel |
+| Argo CD | v3.5.2 | |
+| Sealed Secrets | v0.39.1 | **kubeseal (Homebrew) と揃える必要がある**。ずれると封が開かない |
 
-変更するときは `k8s/cluster/bootstrap.sh` の先頭の変数を書き換える。
+変更するときは `bootstrap.sh` の先頭の変数を書き換える。
 
 ## ネットワークの前提 (ここが一番ハマる)
 
@@ -136,7 +258,7 @@ LoadBalancer 用に確保する 192.168.104.240/28 は、DHCP が配る下位ア
 
 ### 1. `make vms` — VM を起動する
 
-`k8s/cluster/lima-node.yaml` から 3 台作る。テンプレートがやるのは
+`lima-node.yaml` から 3 台作る。テンプレートがやるのは
 **kubeadm を実行できる状態までのノード準備だけ**。
 
 - swap 無効化 (有効だと kubelet が起動を拒否する)
@@ -214,6 +336,40 @@ Gateway API の CRD (standard channel) を入れてから `istioctl install --se
 Service を Istio が自動生成する**ため。従来の istio-ingressgateway を
 先に立てておく必要がない。
 
+### 9. `make gateway` — 共有 Gateway
+
+`k8s/gateway/` を apply して `istio-ingress` namespace に Gateway を 1 枚立てる。
+Istio が gateway の Deployment と Service(LoadBalancer) を生成し、
+Cilium の LB IPAM が `192.168.104.240` を払い出す。
+
+listener は `allowedRoutes.namespaces.from: All`。これがないと別 namespace の
+アプリが `parentRefs` でぶら下がれない。この namespace には
+`istio-injection` ラベルを**付けない** — gateway Pod 自身が Envoy なので、
+その中にもう一枚 sidecar を挿す意味がない。
+
+### 10. `make sealed` — Sealed Secrets
+
+controller を `kube-system` に入れる。起動時にクラスタ内で鍵ペアを作り、
+公開鍵で封をした `SealedSecret` を Secret に復号する。
+鍵はクラスタの外に出ないので、暗号文は public repo に置ける。
+
+### 11. `make argocd` — Argo CD
+
+```
+kubectl -n argocd apply --server-side --force-conflicts -f .../install.yaml
+```
+
+**`--server-side` が必須。** クライアント側 apply は
+`last-applied-configuration` を annotation に丸ごと入れるが、
+`applicationsets` の CRD がその 256KB 上限を超えて弾かれる。
+
+そのあと `server.insecure=true` を `argocd-cmd-params-cm` に merge patch する。
+argocd-server は既定で自分が TLS を終端し平文 HTTP を HTTPS にリダイレクトするので、
+**Gateway が平文で受けている構成だとリダイレクトがループする**。
+
+最後に `k8s/apps/` の Application を登録する。`make up` ではレジストリの
+**後**に流している (Argo が同期した瞬間に Pod がイメージを取りに行くため)。
+
 ## ホストからのアクセス (実測でわかったこと)
 
 **クラスタ内では Cilium の L2 広告は正しく動く。** cp からも worker からも
@@ -232,7 +388,7 @@ user-v2 がユーザモードのネットワークであることに起因する
 対処は cp ノードを踏み台にした SSH トンネル。
 
 ```bash
-アプリ側の make k8s-tunnel        # http://127.0.0.1:18080
+make tunnel        # 127.0.0.1:18080 -> 共有 Gateway
 ```
 
 これは LB IP 宛にトンネルするので、**Cilium の LoadBalancer 経路と
