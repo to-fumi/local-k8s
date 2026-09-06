@@ -7,7 +7,7 @@ macOS 上の Lima VM 3 台に kubeadm でクラスタを組み、Cilium (eBPF) �
 wfd-cp   192.168.104.1   control-plane
 wfd-w1   192.168.104.4   worker
 wfd-w2   192.168.104.3   worker
-docker   192.168.104.5   ビルド用 + レジストリ (クラスタ外)
+docker   192.168.104.5   ビルド用 + レジストリ (registry.local:5000)
 ```
 
 ## 立てる
@@ -21,23 +21,26 @@ make up          # 15〜20 分
 
 ```
 KUBECTX=kubeadm-local
-REGISTRY=192.168.104.5:5000
+REGISTRY=registry.local:5000
 ```
+
+レジストリは**固定のホスト名**で公開する。docker VM の IP は DHCP で変わるので、
+IP をイメージ名に埋めるとアプリ側のマニフェストが環境依存になりリース更新のたびに
+差分が出る。`make registry` が各ノードと docker VM の `/etc/hosts` に
+`registry.local` を書くので、イメージ名は常に `registry.local:5000/...` で固定できる。
 
 ## 他のリポジトリから使う
 
 アプリ側が知る必要があるのは**この 2 つだけ**。あとは普通に build して push して apply する。
 
 ```bash
-REGISTRY=$(make -s -C ../local-k8s registry-addr)
-
-docker build -t $REGISTRY/myapp:dev .
-docker push $REGISTRY/myapp:dev
+docker build -t registry.local:5000/myapp:dev .
+docker push registry.local:5000/myapp:dev
 kubectl --context kubeadm-local apply -k k8s/overlays/local
 ```
 
-アプリ側の Makefile に埋めるならこう書く。**レジストリのアドレスは docker VM の
-DHCP で変わるので、固定値を持たず毎回引く**こと。
+マニフェストには `registry.local:5000/myapp:dev` をそのまま書いてコミットしていい
+(環境依存の値が入らない)。Makefile から引くならこう。
 
 ```make
 LOCAL_K8S ?= ../local-k8s

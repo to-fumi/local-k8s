@@ -33,6 +33,8 @@ GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.2}
 LOCAL_PATH_VERSION=${LOCAL_PATH_VERSION:-v0.0.31}
 # user-v2 のサブネットは 192.168.104.0/24。DHCP と衝突しない上位を LoadBalancer に回す。
 LB_POOL=${LB_POOL:-192.168.104.240/28}
+# レジストリのホスト名。実 IP は各ノードの /etc/hosts が解決する。
+REGISTRY_HOST=${REGISTRY_HOST:-registry.local}
 
 KUBECTL="kubectl --context ${KUBECTX}"
 
@@ -260,10 +262,18 @@ step_registry() {
     echo "ERROR: docker VM が user-v2 に繋がっていない。make docker-vm-net を先に実行すること。" >&2
     exit 1
   fi
-  local registry="${reg_ip}:5000"
+  # レジストリは IP ではなく固定のホスト名で参照する。
+  # docker VM の IP は DHCP で変わるため、IP を直接イメージ名に埋めると
+  # アプリ側のマニフェストが環境依存になり、リース更新のたびに差分が出る。
+  # 名前解決を /etc/hosts に寄せて、イメージ名は常に registry.local:5000 に固定する。
+  local registry="${REGISTRY_HOST}:5000"
 
   # docker デーモンは平文 HTTP のレジストリを拒否する (localhost 以外)。
   # rootless docker の daemon.json に insecure-registries を足して再起動する。
+  echo "==> docker VM の /etc/hosts に ${REGISTRY_HOST} を登録"
+  limactl shell "$DOCKER_VM" -- sudo sh -c \
+    "sed -i '/[[:space:]]${REGISTRY_HOST}\$/d' /etc/hosts && echo '127.0.0.1 ${REGISTRY_HOST}' >> /etc/hosts"
+
   echo "==> docker デーモンに ${registry} を insecure registry として登録"
   limactl shell "$DOCKER_VM" -- python3 - "$registry" <<'PYEOF_GUEST'
 import json, os, sys
@@ -296,8 +306,10 @@ PYEOF_GUEST
   # 各ノードの containerd に「このレジストリは平文 HTTP でいい」と教える。
   # レジストリのアドレスは docker VM の DHCP 次第で変わるので、
   # VM 作成時に焼き込まず毎回ここで書き直す。
-  echo "==> 各ノードの containerd に ${registry} を登録"
+  echo "==> 各ノードの /etc/hosts と containerd に ${registry} を登録"
   for n in $CP $WORKERS; do
+    limactl shell "$n" -- sudo sh -c \
+      "sed -i '/[[:space:]]${REGISTRY_HOST}\$/d' /etc/hosts && echo '${reg_ip} ${REGISTRY_HOST}' >> /etc/hosts"
     limactl shell "$n" -- sudo mkdir -p "/etc/containerd/certs.d/${registry}"
     limactl shell "$n" -- sudo tee "/etc/containerd/certs.d/${registry}/hosts.toml" >/dev/null <<EOF
 server = "http://${registry}"
@@ -350,12 +362,8 @@ step_docker_vm() {
 # --- 他リポジトリ向けの接続情報 ------------------------------------------
 # アプリ側のリポジトリはこの 2 つだけ知っていればクラスタに載せられる。
 
-step_registry_addr() {
-  local ip
-  ip=$(node_ip "$DOCKER_VM" 2>/dev/null || true)
-  [ -n "$ip" ] || { echo "docker VM が起動していない" >&2; exit 1; }
-  echo "${ip}:5000"
-}
+# アプリ側のマニフェストに書ける固定値を返す。実体の IP は /etc/hosts が吸収する。
+step_registry_addr() { echo "${REGISTRY_HOST}:5000"; }
 
 step_context() { echo "$KUBECTX"; }
 
