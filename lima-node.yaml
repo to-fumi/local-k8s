@@ -1,0 +1,128 @@
+# what-for-dinner: kubeadm クラスタのノード用 Lima テンプレート
+#
+# 使い方は Makefile の cluster-vms ターゲット経由。直接叩くなら:
+#   limactl start --name wfd-cp --network lima:user-v2 k8s/cluster/lima-node.yaml
+#
+# ネットワークについて:
+#   vzNAT は「ホストからは到達できるが他のゲストからは到達できない」ため、
+#   マルチノードクラスタには使えない (Lima の default.yaml に明記されている)。
+#   lima:user-v2 は VM 間通信ができて、socket_vmnet と違い root デーモンも sudo も不要。
+#
+# このテンプレートがやるのは「kubeadm を実行できる状態までのノード準備」だけ。
+# kubeadm init / join, CNI, アドオンは Makefile のターゲットで明示的に流す
+# (途中で失敗したステップだけ再実行できるようにするため)。
+
+minimumLimaVersion: 2.0.0
+base: template:_images/ubuntu-24.04
+
+vmType: vz
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+
+# ノードにホスト側のファイルシステムは要らない
+mounts: []
+
+# containerd と CNI プラグインは Lima に入れさせる (nerdctl full bundle)
+containerd:
+  system: true
+  user: false
+
+param:
+  # Cilium v1.20 が e2e テストしている k8s は 1.33-1.36。
+  # k8s の stable は v1.37 だが、CNI が動かないとクラスタが成立しないので 1.36 に合わせる。
+  k8sMinor: "v1.36"
+
+provision:
+# ---------------------------------------------------------------------------
+# 1. kubeadm の前提を作る + kubeadm/kubelet/kubectl を入れる
+# ---------------------------------------------------------------------------
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    command -v kubeadm >/dev/null 2>&1 && exit 0
+
+    # swap を無効化 (kubelet は swap が有効だと起動を拒否する)
+    swapoff -a || true
+    sed -i.bak '/[[:space:]]swap[[:space:]]/s/^/#/' /etc/fstab || true
+
+    # Pod 間トラフィックが bridge を通るときに netfilter を効かせる
+    cat <<EOF >/etc/modules-load.d/k8s.conf
+    overlay
+    br_netfilter
+    EOF
+    modprobe overlay
+    modprobe br_netfilter
+
+    cat <<EOF >/etc/sysctl.d/99-kubernetes-cri.conf
+    net.bridge.bridge-nf-call-iptables  = 1
+    net.bridge.bridge-nf-call-ip6tables = 1
+    net.ipv4.ip_forward                 = 1
+    EOF
+    sysctl --system
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y apt-transport-https ca-certificates curl gpg
+
+    # pkgs.k8s.io から kubeadm 一式
+    RELEASE="{{.Param.k8sMinor}}"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/${RELEASE}/deb/Release.key" \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${RELEASE}/deb/ /" \
+      >/etc/apt/sources.list.d/kubernetes.list
+    apt-get update
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+    systemctl enable --now kubelet
+
+    # eBPF を覗くための道具 (Cilium の bpf マップを直接見る用)
+    apt-get install -y bpftrace linux-tools-common "linux-tools-$(uname -r)" || \
+      apt-get install -y bpftrace || true
+
+# ---------------------------------------------------------------------------
+# 2. containerd を kubeadm 向けに設定する
+# ---------------------------------------------------------------------------
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ -e /etc/containerd/conf.d/k8s.toml ] && exit 0
+    mkdir -p /etc/containerd/conf.d
+    cat <<EOF >/etc/containerd/conf.d/k8s.toml
+    version = 2
+    [plugins]
+      [plugins."io.containerd.grpc.v1.cri"]
+        sandbox_image = "$(kubeadm config images list | grep pause | sort -r | head -n1)"
+        [plugins."io.containerd.grpc.v1.cri".containerd]
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+              runtime_type = "io.containerd.runc.v2"
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                # cgroup ドライバを systemd に揃える。
+                # ここを外すと kubelet と食い違って Pod が立たない定番の罠。
+                SystemdCgroup = true
+        # 個々のレジストリの設定は certs.d 配下に置く。中身は bootstrap.sh の
+        # registry ステップが書く (レジストリのアドレスは docker VM の DHCP 次第で
+        # 変わるので、VM 作成時に焼き込まない)。
+        [plugins."io.containerd.grpc.v1.cri".registry]
+          config_path = "/etc/containerd/certs.d"
+      [plugins."io.containerd.cri.v1.runtime".cni]
+        bin_dirs = ["/usr/local/libexec/cni","/opt/cni/bin"]
+    EOF
+
+    systemctl restart containerd
+
+probes:
+- description: "kubeadm to be installed"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 300s bash -c "until command -v kubeadm >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "kubeadm is not installed yet"
+      exit 1
+    fi
+  hint: |
+    ゲストの /var/log/cloud-init-output.log を見ること
